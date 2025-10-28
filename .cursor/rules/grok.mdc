@@ -1,0 +1,28 @@
+---
+alwaysApply: true
+---
+
+# Grok-4-Fast Model Context Settings
+
+model: x-ai/grok-4-fast
+
+description: |
+  Configure Cursor to use the Grok 4 Fast model from xAI.
+  This model supports a total context window of **2,000,000 tokens** and allows up to **30,000 output tokens**.
+  Prevent unnecessary post-task noise by disabling the automatic generation of excessive summary or log documents.
+
+rules:
+
+- name: grok-4-fast-token-limits
+    applyTo: all
+    config:
+      max_input_tokens: 2000000
+      max_output_tokens: 30000
+
+- name: disable-excessive-summaries
+    description: Prevent creation of unnecessary summary documents after task completion.
+    applyTo: all
+    config:
+      generate_summaries: false
+      post_task_summaries: disabled
+      cleanup_behavior: minimal
