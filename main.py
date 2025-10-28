@@ -222,7 +222,7 @@ class StatsResponse(BaseModel):
 class APIKeyCreateRequest(BaseModel):
     """Request model for creating a new API key"""
     user_name: str = Field(..., min_length=1, max_length=100)
-    user_email: str = Field(..., regex=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    user_email: str = Field(..., pattern=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
     rate_limit: int = Field(default=10, ge=1, le=100)
     notes: Optional[str] = Field(None, max_length=500)
 
