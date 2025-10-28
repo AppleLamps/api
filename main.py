@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Security, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 import httpx
@@ -8,27 +10,168 @@ import re
 from datetime import datetime
 import asyncio
 from urllib.parse import urljoin, quote
+import logging
+import os
+from dotenv import load_dotenv
+import sentry_sdk
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import redis.asyncio as aioredis
+import json
+from models import init_db, get_api_key_record, update_api_key_usage, create_api_key, revoke_api_key, get_all_api_keys, SessionLocal, APIKey
+
+# Load environment variables
+load_dotenv()
+
+# Environment configuration
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+BASE_URL = os.getenv("BASE_URL", "https://grokipedia.com")
+TIMEOUT = float(os.getenv("TIMEOUT", "30"))
+
+# Rate limiting
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
+
+# Redis cache
+REDIS_ENABLED = os.getenv("REDIS_ENABLED", "true").lower() == "true"
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
+
+# Authentication
+API_KEY_AUTH_ENABLED = os.getenv("API_KEY_AUTH_ENABLED", "true").lower() == "true"
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+
+# Sentry error tracking
+SENTRY_ENABLED = os.getenv("SENTRY_ENABLED", "false").lower() == "true"
+SENTRY_DSN = os.getenv("SENTRY_DSN", "")
+if SENTRY_ENABLED and SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        environment=ENVIRONMENT,
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+    )
+
+# Logging configuration
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# CORS configuration
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", '["*"]')
+try:
+    cors_origins = json.loads(CORS_ORIGINS) if CORS_ORIGINS != "*" else ["*"]
+except:
+    cors_origins = ["*"]
 
 app = FastAPI(
     title="Grokipedia API",
     description="Programmatic access to Grokipedia content for AI models and applications",
     version="1.0.0",
-    docs_url="/",
-    redoc_url="/redoc"
+    docs_url="/" if os.getenv("DOCS_ENABLED", "true") == "true" else None,
+    redoc_url="/redoc" if os.getenv("REDOC_ENABLED", "true") == "true" else None,
+    debug=DEBUG
 )
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "HEAD", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# Constants
-BASE_URL = "https://grokipedia.com"
-TIMEOUT = 30.0
+# Global Redis client
+redis_client: Optional[aioredis.Redis] = None
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all incoming requests"""
+    logger.info(f"{request.method} {request.url.path} - IP: {get_remote_address(request)}")
+    response = await call_next(request)
+    logger.info(f"{request.method} {request.url.path} - Status: {response.status_code}")
+    return response
+
+# Startup event
+@app.on_event("startup")
+async def startup():
+    """Initialize database and Redis connection on startup"""
+    global redis_client
+    
+    # Initialize database
+    try:
+        init_db()
+        logger.info("✓ Database initialized - API key tables ready")
+    except Exception as e:
+        logger.error(f"✗ Database initialization failed: {e}")
+    
+    if REDIS_ENABLED:
+        try:
+            redis_client = await aioredis.from_url(REDIS_URL)
+            await redis_client.ping()
+            logger.info("✓ Redis connected successfully")
+        except Exception as e:
+            logger.warning(f"✗ Failed to connect to Redis: {e}")
+            redis_client = None
+    logger.info(f"✓ API started in {ENVIRONMENT} mode")
+
+# Shutdown event
+@app.on_event("shutdown")
+async def shutdown():
+    """Close Redis connection on shutdown"""
+    global redis_client
+    if redis_client:
+        await redis_client.close()
+        logger.info("✓ Redis connection closed")
+
+# API Key authentication
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def verify_api_key(api_key: Optional[str] = Depends(API_KEY_HEADER)) -> Optional[str]:
+    """Verify API key if authentication is enabled"""
+    if not API_KEY_AUTH_ENABLED:
+        return None
+    
+    if not api_key:
+        raise HTTPException(
+            status_code=403,
+            detail="API key required. Use header: X-API-Key"
+        )
+    
+    db = SessionLocal()
+    try:
+        key_record = get_api_key_record(db, api_key)
+        if not key_record:
+            logger.warning(f"Invalid API key attempt: {api_key[:10]}...")
+            raise HTTPException(status_code=403, detail="Invalid API key")
+        
+        logger.info(f"Authenticated user: {key_record.user_name} ({key_record.user_email})")
+        
+        # Update last used timestamp asynchronously
+        asyncio.create_task(async_update_key_usage(api_key))
+        
+        return api_key
+    finally:
+        db.close()
+
+
+async def async_update_key_usage(key: str):
+    """Update API key usage timestamp (non-blocking)"""
+    try:
+        update_api_key_usage(key)
+    except Exception as e:
+        logger.debug(f"Failed to update key usage: {e}")
 
 # Pydantic models
 class Section(BaseModel):
@@ -75,9 +218,71 @@ class StatsResponse(BaseModel):
     scraped_at: str
 
 
+# API Key Management Models
+class APIKeyCreateRequest(BaseModel):
+    """Request model for creating a new API key"""
+    user_name: str = Field(..., min_length=1, max_length=100)
+    user_email: str = Field(..., regex=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    rate_limit: int = Field(default=10, ge=1, le=100)
+    notes: Optional[str] = Field(None, max_length=500)
+
+
+class APIKeyResponse(BaseModel):
+    """Response model for API key operations"""
+    id: str
+    key: str
+    user_name: str
+    user_email: str
+    rate_limit: int
+    is_active: bool
+    created_at: str
+    last_used: Optional[str]
+    notes: Optional[str]
+
+
+class APIKeyListResponse(BaseModel):
+    """Response model for listing API keys"""
+    id: str
+    user_name: str
+    user_email: str
+    rate_limit: int
+    is_active: bool
+    created_at: str
+    last_used: Optional[str]
+
+
 # Helper functions
+async def get_from_cache(key: str) -> Optional[str]:
+    """Get data from Redis cache"""
+    if not redis_client:
+        return None
+    try:
+        data = await redis_client.get(key)
+        if data:
+            logger.debug(f"Cache hit: {key}")
+            return data.decode() if isinstance(data, bytes) else data
+    except Exception as e:
+        logger.warning(f"Cache read error: {e}")
+    return None
+
+async def set_in_cache(key: str, value: str, ttl: int = CACHE_TTL):
+    """Set data in Redis cache"""
+    if not redis_client:
+        return
+    try:
+        await redis_client.setex(key, ttl, value)
+        logger.debug(f"Cache set: {key}")
+    except Exception as e:
+        logger.warning(f"Cache write error: {e}")
+
 async def fetch_html(url: str) -> str:
-    """Fetch HTML content from URL with error handling"""
+    """Fetch HTML content from URL with error handling and caching"""
+    # Try cache first
+    cache_key = f"html:{url}"
+    cached = await get_from_cache(cache_key)
+    if cached:
+        return cached
+    
     async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
         try:
             headers = {
@@ -85,14 +290,22 @@ async def fetch_html(url: str) -> str:
             }
             response = await client.get(url, headers=headers)
             response.raise_for_status()
-            return response.text
+            html = response.text
+            
+            # Cache the HTML
+            await set_in_cache(cache_key, html)
+            
+            return html
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 raise HTTPException(status_code=404, detail=f"Article not found: {url}")
+            logger.error(f"HTTP error {e.response.status_code} fetching {url}")
             raise HTTPException(status_code=e.response.status_code, detail=f"Error fetching page: {str(e)}")
         except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Request timeout")
+            logger.error(f"Timeout fetching {url}")
+            raise HTTPException(status_code=504, detail="Request timeout - Grokipedia took too long to respond")
         except Exception as e:
+            logger.error(f"Error fetching {url}: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Error fetching page: {str(e)}")
 
 
@@ -212,14 +425,18 @@ def extract_fact_check_info(soup: BeautifulSoup) -> Optional[str]:
 
 
 # API Endpoints
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
+@app.get("/health")
+@limiter.limit(f"{RATE_LIMIT_PER_MINUTE}/minute") if RATE_LIMIT_ENABLED else lambda f: f
+async def health_check(request: Request, api_key: Optional[str] = Depends(verify_api_key)):
     """Check API health and connectivity"""
-    return HealthResponse(
-        status="healthy",
-        timestamp=datetime.utcnow().isoformat(),
-        base_url=BASE_URL
-    )
+    logger.info("Health check endpoint called")
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "base_url": BASE_URL,
+        "environment": ENVIRONMENT,
+        "cache_enabled": REDIS_ENABLED
+    }
 
 
 @app.get("/stats", response_model=StatsResponse)
@@ -242,12 +459,14 @@ async def get_stats():
 
 
 @app.get("/article/{slug}", response_model=Article)
-async def get_article(slug: str):
+@limiter.limit(f"{RATE_LIMIT_PER_MINUTE}/minute") if RATE_LIMIT_ENABLED else lambda f: f
+async def get_article(request: Request, slug: str, api_key: Optional[str] = Depends(verify_api_key)):
     """
     Get a complete article from Grokipedia by slug
     
     Example: /article/Joe_Biden
     """
+    logger.info(f"Fetching article: {slug}")
     url = f"{BASE_URL}/page/{slug}"
     html = await fetch_html(url)
     soup = BeautifulSoup(html, 'html.parser')
@@ -325,10 +544,12 @@ async def get_article(slug: str):
 
 
 @app.get("/article/{slug}/summary")
-async def get_article_summary(slug: str):
+@limiter.limit(f"{RATE_LIMIT_PER_MINUTE}/minute") if RATE_LIMIT_ENABLED else lambda f: f
+async def get_article_summary(request: Request, slug: str, api_key: Optional[str] = Depends(verify_api_key)):
     """
     Get just the summary/intro of an article (faster, less data)
     """
+    logger.info(f"Fetching summary: {slug}")
     url = f"{BASE_URL}/page/{slug}"
     html = await fetch_html(url)
     soup = BeautifulSoup(html, 'html.parser')
@@ -378,11 +599,13 @@ async def get_article_summary(slug: str):
 
 
 @app.get("/article/{slug}/section/{section_title}")
-async def get_article_section(slug: str, section_title: str):
+@limiter.limit(f"{RATE_LIMIT_PER_MINUTE}/minute") if RATE_LIMIT_ENABLED else lambda f: f
+async def get_article_section(request: Request, slug: str, section_title: str, api_key: Optional[str] = Depends(verify_api_key)):
     """
     Get a specific section of an article by title
     """
-    article = await get_article(slug)
+    logger.info(f"Fetching section '{section_title}' from '{slug}'")
+    article = await get_article(request, slug, api_key)
     
     # Find matching section (case-insensitive, partial match)
     section_title_lower = section_title.lower().replace('_', ' ')
@@ -402,10 +625,8 @@ async def get_article_section(slug: str, section_title: str):
 
 
 @app.get("/search")
-async def search_articles(
-    q: str = Query(..., description="Search query"),
-    limit: int = Query(10, ge=1, le=50, description="Maximum number of results")
-):
+@limiter.limit(f"{RATE_LIMIT_PER_MINUTE}/minute") if RATE_LIMIT_ENABLED else lambda f: f
+async def search_articles(request: Request, q: str = Query(..., description="Search query"), limit: int = Query(10, ge=1, le=50, description="Maximum number of results"), api_key: Optional[str] = Depends(verify_api_key)):
     """
     Search for articles (Note: This is a basic implementation)
     
@@ -414,7 +635,7 @@ async def search_articles(
     2. Maintaining your own index
     3. Using their API if available
     """
-    # This is a placeholder - implement actual search logic based on site structure
+    logger.info(f"Search query: {q}")
     return {
         "query": q,
         "results": [],
@@ -445,30 +666,176 @@ async def get_random_article():
 
 # Rate limiting info endpoint
 @app.get("/info")
-async def api_info():
+@limiter.limit(f"{RATE_LIMIT_PER_MINUTE * 5}/minute") if RATE_LIMIT_ENABLED else lambda f: f  # Higher limit for info
+async def api_info(request: Request, api_key: Optional[str] = Depends(verify_api_key)):
     """Get information about this API"""
+    logger.info("API info endpoint called")
     return {
         "name": "Grokipedia API",
         "version": "1.0.0",
+        "environment": ENVIRONMENT,
         "description": "Unofficial API for accessing Grokipedia content",
+        "documentation": "https://yourdomain.com/docs" if not DEBUG else "http://localhost:8000/",
         "endpoints": {
             "GET /health": "Health check",
-            "GET /stats": "Get site statistics",
             "GET /article/{slug}": "Get full article",
             "GET /article/{slug}/summary": "Get article summary",
             "GET /article/{slug}/section/{section_title}": "Get specific section",
-            "GET /search?q={query}": "Search articles (basic)",
+            "GET /search?q={query}": "Search articles",
             "GET /info": "This endpoint"
         },
         "base_url": BASE_URL,
+        "rate_limit": {
+            "enabled": RATE_LIMIT_ENABLED,
+            "requests_per_minute": RATE_LIMIT_PER_MINUTE
+        },
+        "cache": {
+            "enabled": REDIS_ENABLED,
+            "ttl_seconds": CACHE_TTL
+        },
         "notes": [
-            "This is an unofficial API that scrapes content",
+            "This is an unofficial API that scrapes content from Grokipedia",
             "Please respect rate limits and robots.txt",
-            "Consider caching responses to reduce load",
-            "For production use, implement proper rate limiting"
+            "Cache is enabled to reduce load on Grokipedia",
+            "For production use, implement proper monitoring"
         ],
-        "legal": "Please check Grokipedia's Terms of Service before heavy usage"
+        "legal": "Not affiliated with Grokipedia. Please review their ToS before heavy usage"
     }
+
+
+# API Key Management Endpoints
+@app.post("/admin/keys/create", response_model=APIKeyResponse)
+async def create_new_api_key(request: APIKeyCreateRequest, admin_key: str = Query(..., description="Admin key for authorization")):
+    """
+    Create a new API key (requires admin key)
+    
+    Example admin_key query: ?admin_key=your-admin-key
+    """
+    # Verify admin key
+    if not admin_key or admin_key != ADMIN_KEY or not ADMIN_KEY:
+        logger.warning(f"Unauthorized API key creation attempt")
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    
+    try:
+        new_key = create_api_key(
+            user_name=request.user_name,
+            user_email=request.user_email,
+            rate_limit=request.rate_limit,
+            notes=request.notes
+        )
+        
+        db = SessionLocal()
+        try:
+            key_record = db.query(APIKey).filter(APIKey.key == new_key).first()
+            logger.info(f"✓ Created API key for {request.user_name} ({request.user_email})")
+            
+            return APIKeyResponse(
+                id=key_record.id,
+                key=new_key,
+                user_name=key_record.user_name,
+                user_email=key_record.user_email,
+                rate_limit=key_record.rate_limit,
+                is_active=key_record.is_active,
+                created_at=key_record.created_at.isoformat(),
+                last_used=key_record.last_used.isoformat() if key_record.last_used else None,
+                notes=key_record.notes
+            )
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"Error creating API key: {e}")
+        raise HTTPException(status_code=500, detail=f"Error creating API key: {str(e)}")
+
+
+@app.get("/admin/keys", response_model=List[APIKeyListResponse])
+async def list_api_keys(admin_key: str = Query(...), active_only: bool = Query(True)):
+    """
+    List all API keys (requires admin key)
+    
+    Example: /admin/keys?admin_key=your-admin-key&active_only=true
+    """
+    # Verify admin key
+    if not admin_key or admin_key != ADMIN_KEY or not ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    
+    try:
+        keys = get_all_api_keys(active_only=active_only)
+        logger.info(f"Listed {len(keys)} API keys")
+        
+        return [
+            APIKeyListResponse(
+                id=key.id,
+                user_name=key.user_name,
+                user_email=key.user_email,
+                rate_limit=key.rate_limit,
+                is_active=key.is_active,
+                created_at=key.created_at.isoformat(),
+                last_used=key.last_used.isoformat() if key.last_used else None
+            )
+            for key in keys
+        ]
+    except Exception as e:
+        logger.error(f"Error listing API keys: {e}")
+        raise HTTPException(status_code=500, detail=f"Error listing API keys: {str(e)}")
+
+
+@app.delete("/admin/keys/{key_id}")
+async def revoke_key(key_id: str, admin_key: str = Query(...)):
+    """
+    Revoke an API key (requires admin key)
+    
+    Example: /admin/keys/key-id?admin_key=your-admin-key
+    """
+    # Verify admin key
+    if not admin_key or admin_key != ADMIN_KEY or not ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    
+    try:
+        success = revoke_api_key(key_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="API key not found")
+        
+        logger.info(f"✓ Revoked API key: {key_id}")
+        return {"message": "API key revoked successfully", "key_id": key_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error revoking API key: {e}")
+        raise HTTPException(status_code=500, detail=f"Error revoking API key: {str(e)}")
+
+
+@app.get("/admin/keys/{key_id}")
+async def get_key_details(key_id: str, admin_key: str = Query(...)):
+    """
+    Get details about a specific API key (requires admin key)
+    """
+    # Verify admin key
+    if not admin_key or admin_key != ADMIN_KEY or not ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    
+    try:
+        db = SessionLocal()
+        try:
+            key_record = db.query(APIKey).filter(APIKey.id == key_id).first()
+            if not key_record:
+                raise HTTPException(status_code=404, detail="API key not found")
+            
+            return APIKeyListResponse(
+                id=key_record.id,
+                user_name=key_record.user_name,
+                user_email=key_record.user_email,
+                rate_limit=key_record.rate_limit,
+                is_active=key_record.is_active,
+                created_at=key_record.created_at.isoformat(),
+                last_used=key_record.last_used.isoformat() if key_record.last_used else None
+            )
+        finally:
+            db.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching API key details: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching API key details: {str(e)}")
 
 
 if __name__ == "__main__":

@@ -16,20 +16,24 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The API will start at: **http://localhost:8000**
+The API will start at: **<http://localhost:8000>**
 
 ## Test it Out
 
 ### 1. Open Interactive Docs
-Visit http://localhost:8000 in your browser to see the Swagger UI with all endpoints.
+
+Visit <http://localhost:8000> in your browser to see the Swagger UI with all endpoints.
 
 ### 2. Try the Examples
+
 In a new terminal, run:
+
 ```bash
 python example_usage.py
 ```
 
 ### 3. Manual Test
+
 ```bash
 # Health check
 curl http://localhost:8000/health
@@ -44,6 +48,7 @@ curl http://localhost:8000/article/Joe_Biden/summary
 ## Common Usage Patterns
 
 ### For AI Models
+
 ```python
 import requests
 
@@ -57,6 +62,7 @@ print(f"Content: {article['full_content'][:500]}...")
 ```
 
 ### Get Specific Information
+
 ```python
 # Get just a summary
 response = requests.get("http://localhost:8000/article/Joe_Biden/summary")
@@ -88,20 +94,23 @@ response = requests.get("http://localhost:8000/article/Joe_Biden/section/Preside
 
 1. ✅ Read the full [README.md](README.md) for detailed documentation
 2. ✅ Check [example_usage.py](example_usage.py) for more examples
-3. ✅ Review the interactive docs at http://localhost:8000
+3. ✅ Review the interactive docs at <http://localhost:8000>
 4. ✅ Implement caching for production use
 
 ## Troubleshooting
 
 **"Connection Error"**
+
 - Make sure the API is running: `python main.py`
 - Check if port 8000 is already in use
 
 **"Article not found"**
+
 - Verify the article exists on Grokipedia
 - Check the slug format (use underscores, not spaces)
 
 **"Timeout"**
+
 - Article might be very large
 - Check your internet connection
 - Increase timeout in settings
@@ -109,4 +118,3 @@ response = requests.get("http://localhost:8000/article/Joe_Biden/section/Preside
 ---
 
 Need help? Check the full [README.md](README.md) or open an issue!
-
