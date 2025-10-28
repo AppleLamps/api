@@ -9,6 +9,6 @@ slowapi==0.1.9
 redis==5.0.1
 sentry-sdk==1.45.1
 gunicorn==23.0.0
-sqlalchemy==2.1.0
+sqlalchemy==2.0.44
 psycopg2-binary==2.9.9
 
